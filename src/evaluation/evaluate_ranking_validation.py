@@ -18,7 +18,6 @@ K = 10
 MAX_USERS = 500
 SEED = 42
 CANDIDATE_COUNT = 2000
-EMBEDDING_DIM = 32
 
 
 def recall_at_k(recommended, relevant):
@@ -54,11 +53,14 @@ def main():
     index = faiss.read_index(str(MODEL_DIR / "movies.faiss"))
 
     if index.ntotal != len(movie_ids):
-        raise ValueError("FAISS index and movie ID list do not match.")
+        raise ValueError(
+            "FAISS index and movie ID list do not match."
+        )
 
     if ranker.input_shape[-1] != 83:
         raise ValueError(
-            f"Expected 83 ranker features, got {ranker.input_shape[-1]}."
+            f"Expected 83 ranker features, got "
+            f"{ranker.input_shape[-1]}."
         )
 
     print("Loading metadata and evaluation data...")
@@ -104,6 +106,19 @@ def main():
 
     indexed_movies = set(movie_ids.tolist())
 
+    # Popularity is calculated from training interactions only.
+    # Stable sorting gives deterministic tie-breaking by movie ID.
+    popularity = (
+        train["movieId"]
+        .value_counts()
+        .reindex(movie_ids, fill_value=0)
+    )
+
+    popularity_order = popularity.sort_values(
+        ascending=False,
+        kind="stable",
+    ).index.to_numpy(dtype=np.int64)
+
     relevant = validation[
         (validation["rating"] >= 4.0)
         & validation["userId"].isin(user_ids)
@@ -133,6 +148,7 @@ def main():
 
     retrieval_recalls = []
     reranked_recalls = []
+    popularity_recalls = []
 
     print(f"Evaluating {len(selected)} users...")
 
@@ -140,12 +156,23 @@ def main():
         relevant_movies = eligible[user_id]
         seen = seen_history.get(user_id, set())
 
+        # Popularity baseline, excluding previously seen movies.
+        popularity_top_k = [
+            int(movie_id)
+            for movie_id in popularity_order
+            if int(movie_id) not in seen
+        ][:K]
+
+        popularity_recalls.append(
+            recall_at_k(popularity_top_k, relevant_movies)
+        )
+
         user_vector = user_model(
             tf.constant([user_id]),
             training=False,
         ).numpy().astype(np.float32)
 
-        # Retrieval uses the same normalized user vector as before.
+        # Retrieve candidates using the normalized user vector.
         retrieval_vector = user_vector.copy()
         faiss.normalize_L2(retrieval_vector)
 
@@ -185,7 +212,6 @@ def main():
                 candidate_df[genre_columns].fillna(0)
             )
 
-            # Compute one movie embedding per candidate.
             movie_vectors = movie_model(
                 tf.constant(
                     candidate_df["movieId"].astype(str).to_numpy()
@@ -193,7 +219,6 @@ def main():
                 training=False,
             ).numpy().astype(np.float32)
 
-            # Repeat this user's embedding for every candidate.
             user_vectors = np.repeat(
                 user_vector,
                 len(candidate_df),
@@ -204,8 +229,7 @@ def main():
                 genre_columns
             ].to_numpy(dtype=np.float32)
 
-            # Feature order must match the ranker training script:
-            # 32 user embeddings + 32 movie embeddings + 19 genres.
+            # Feature order: 32 user + 32 movie + 19 genre features.
             X = np.column_stack(
                 [user_vectors, movie_vectors, genre_values]
             ).astype(np.float32)
@@ -222,7 +246,7 @@ def main():
                 verbose=0,
             ).ravel()
 
-            order = np.argsort(-scores)
+            order = np.argsort(-scores, kind="stable")
 
             reranked_top_k = candidate_df.iloc[order][
                 "movieId"
@@ -240,21 +264,32 @@ def main():
 
     retrieval_recall = float(np.mean(retrieval_recalls))
     reranked_recall = float(np.mean(reranked_recalls))
-    difference = reranked_recall - retrieval_recall
+    popularity_recall = float(np.mean(popularity_recalls))
 
     print("\n--- Validation Results ---")
     print(f"Users evaluated: {len(selected)}")
     print(f"Candidate count: {CANDIDATE_COUNT}")
     print(f"Retrieval-only Recall@{K}: {retrieval_recall:.4f}")
     print(f"Retrieval + embedding ranker Recall@{K}: {reranked_recall:.4f}")
-    print(f"Recall difference: {difference:+.4f}")
+    print(f"Popularity Recall@{K}: {popularity_recall:.4f}")
+    print(
+        f"Ranker vs retrieval: "
+        f"{reranked_recall - retrieval_recall:+.4f}"
+    )
+    print(
+        f"Ranker vs popularity: "
+        f"{reranked_recall - popularity_recall:+.4f}"
+    )
 
-    if difference > 0:
-        print("Result: The embedding ranker improved Recall@10.")
-    elif difference < 0:
-        print("Result: The embedding ranker reduced Recall@10.")
+    if reranked_recall > retrieval_recall:
+        print("Result: Ranker improves on retrieval-only.")
     else:
-        print("Result: No change in Recall@10.")
+        print("Result: Ranker does not improve on retrieval-only.")
+
+    if reranked_recall > popularity_recall:
+        print("Result: Ranker beats the popularity baseline.")
+    else:
+        print("Result: Ranker does not beat the popularity baseline.")
 
 
 if __name__ == "__main__":
