@@ -1,0 +1,20 @@
+Experiment: Embedding-Based Ranking
+Dataset: MovieLens 25M
+Validation users: 500
+Candidate count: 2000
+K: 10
+
+Retrieval-only Recall@10: 0.0169
+Retrieval + embedding ranker Recall@10: 0.0431
+Absolute improvement: 0.0262
+Relative improvement: 155.0%
+Recall multiplier: 2.55x
+
+Ranker features:
+- 32 user embedding dimensions
+- 32 movie embedding dimensions
+- 19 genre features
+- Total: 83 features
+
+Status: Validation improvement observed.
+Caution: Further validation required before production deployment.
